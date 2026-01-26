@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Behavior Capture</title>
+  <style>
+    body{font-family:Arial;padding:8px;width:320px}
+    .tz { display:flex; justify-content:space-between; margin:6px 0; }
+    button { margin-top:8px; }
+  </style>
+</head>
+<body>
+  <strong>Behavior Capture</strong>
+  <div id="clocks">
+    <div class="tz"><span>Local</span><span id="t_local">--:--:--</span></div>
+    <div class="tz"><span>UTC</span><span id="t_utc">--:--:--</span></div>
+    <div class="tz"><span>New York (ET)</span><span id="t_ny">--:--:--</span></div>
+    <div class="tz"><span>London</span><span id="t_ldn">--:--:--</span></div>
+    <div class="tz"><span>Tokyo</span><span id="t_tok">--:--:--</span></div>
+  </div>
+  <button id="openOptions">Open Options</button>
+  <script src="popup.js"></script>
+</body>
+</html>

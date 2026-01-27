@@ -2,7 +2,7 @@
 // Minimal, privacy-preserving keyboard timing capture. DOES NOT RECORD KEY IDENTITY.
 // When a video play session is active on the page, keyboard capture is suppressed (video content script sets window.__vc_videoCaptureActive).
 
-(function() {
+(function () {
   const buffer = [];
   let flushTimer = null;
   const FLUSH_MS = 2000;
@@ -13,10 +13,17 @@
   }
   function flush() {
     if (buffer.length) {
-      try { chrome.runtime.sendMessage({ type: 'keyboardEventBatch', events: buffer.splice(0) }); } catch(e){}
+      try { chrome.runtime.sendMessage({ type: 'keyboardEventBatch', events: buffer.splice(0) }); } catch (e) { }
     }
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
   }
+
+  // Handle global suppression from background (cross-frame coordination)
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'suppressRaw') {
+      window.__vc_videoCaptureActive = !!msg.active;
+    }
+  });
 
   const pendingDown = [];
 
@@ -27,7 +34,7 @@
       pendingDown.push({ ts: now });
       buffer.push({ ts: now, event_type: 'keydown' });
       scheduleFlush();
-    } catch (err) {}
+    } catch (err) { }
   }
   function handleKeyUp(ev) {
     try {
@@ -40,7 +47,7 @@
       }
       buffer.push({ ts: now, event_type: 'keyup', hold_ms: hold });
       scheduleFlush();
-    } catch (err) {}
+    } catch (err) { }
   }
 
   document.addEventListener('keydown', handleKeyDown, true);

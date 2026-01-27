@@ -70,6 +70,9 @@ const modalityState = {
   mouse: { lastTs: null, sessionId: null, sessionStartTs: null, prevMoveTs: null }
 };
 
+// Track which tabs have active video sessions to coordinate cross-frame suppression
+const activeVideoTabs = new Set();
+
 async function loadConfig() {
   const s = await chrome.storage.local.get(['config']);
   if (s.config) { CONFIG = Object.assign({}, DEFAULT_CONFIG, s.config); }
@@ -210,16 +213,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     else if (msg.type === 'videoCursorBatch' && msg.event) {
       const payload = Object.assign({}, msg.event);
-      payload.tab_id = sender.tab ? sender.tab.id : null;
+      const tabId = sender.tab ? sender.tab.id : null;
+      payload.tab_id = tabId;
       payload.ts_start = payload.ts_start || payload.ts || Date.now();
       payload.ts_end = payload.ts_end || (payload.ts || Date.now());
       payload.video_session_id = payload.video_session_id || makeSessionId('vid');
       payload.config_version = CONFIG.config_version;
+      
+      // Coordination: if video is playing/checkpointing, tell the whole tab to suppress raw kbd/mouse
+      if (tabId && (payload.video_state === 'playing' || payload.video_state === 'play' || payload.video_state === 'playing_checkpoint')) {
+        if (!activeVideoTabs.has(tabId)) {
+          activeVideoTabs.add(tabId);
+          chrome.tabs.sendMessage(tabId, { type: 'suppressRaw', active: true }).catch(() => {});
+        }
+      } else if (tabId && (payload.video_state === 'pause' || payload.video_state === 'ended' || payload.video_state === 'tab_closed')) {
+        // Only remove if this was the last active video in the tab (simplified for now: assume one video per tab or global pause)
+        activeVideoTabs.delete(tabId);
+        chrome.tabs.sendMessage(tabId, { type: 'suppressRaw', active: false }).catch(() => {});
+      }
+
       // Keep video row succinct: we store summary stats not raw samples
       if (payload.samples) payload.cursor_sample_count = payload.cursor_sample_count || payload.samples.length;
       delete payload.samples;
       try {
-        console.log('BG: received videoCursorBatch', { preview: { video_session_id: payload.video_session_id, cursor_sample_count: payload.cursor_sample_count, keyboard_event_count: payload.keyboard_event_count }, fromTab: payload.tab_id });
+        console.log('BG: received videoCursorBatch', { preview: { video_session_id: payload.video_session_id, state: payload.video_state, cursor_sample_count: payload.cursor_sample_count }, fromTab: payload.tab_id });
       } catch(e){}
       await appendRow(STORAGE_KEYS.VIDEO_RAW, payload);
     }

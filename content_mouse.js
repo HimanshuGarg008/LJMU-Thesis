@@ -1,7 +1,7 @@
 // content_mouse.js
 // Capture mouse movement, clicks, and scroll. When video capturing is active on the page, mouse capture for raw (non-video) is suppressed.
 
-(function() {
+(function () {
   const buffer = [];
   let flushTimer = null;
   const FLUSH_MS = 2000;
@@ -12,10 +12,17 @@
   }
   function flush() {
     if (buffer.length) {
-      try { chrome.runtime.sendMessage({ type: 'mouseEventBatch', events: buffer.splice(0) }); } catch(e){}
+      try { chrome.runtime.sendMessage({ type: 'mouseEventBatch', events: buffer.splice(0) }); } catch (e) { }
     }
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
   }
+
+  // Handle global suppression from background (cross-frame coordination)
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'suppressRaw') {
+      window.__vc_videoCaptureActive = !!msg.active;
+    }
+  });
 
   let lastMouseTs = null;
   function onMove(e) {
@@ -26,7 +33,7 @@
       lastMouseTs = now;
       buffer.push({ ts: now, event_type: 'move', x: e.clientX, y: e.clientY });
       scheduleFlush();
-    } catch (err) {}
+    } catch (err) { }
   }
   function onClick(e) {
     try {
@@ -34,7 +41,7 @@
       const now = Date.now();
       buffer.push({ ts: now, event_type: 'click', x: e.clientX, y: e.clientY });
       scheduleFlush();
-    } catch (err) {}
+    } catch (err) { }
   }
   function onScroll(e) {
     try {
@@ -42,7 +49,7 @@
       const now = Date.now();
       buffer.push({ ts: now, event_type: 'scroll', x: window.scrollX || 0, y: window.scrollY || 0 });
       scheduleFlush();
-    } catch (err) {}
+    } catch (err) { }
   }
 
   document.addEventListener('mousemove', onMove, { passive: true });

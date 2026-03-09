@@ -1,41 +1,111 @@
 <!doctype html>
 <html>
+
 <head>
   <meta charset="utf-8" />
   <title>Behavior Capture — Options & Audit</title>
   <style>
-    body { font-family: Arial, padding: 12px; max-width: 1100px; }
-    label { display:block; margin-top:8px; }
-    input[type=number], input[type=text] { width: 180px; }
-    .row { display:flex; gap:12px; align-items:center; margin-top:8px; }
-    .col { flex: 1; min-width: 280px; }
-    button { margin-right:8px; }
-    #dataArea { margin-top:16px; border:1px solid #ddd; padding:8px; background:#fafafa; max-height:520px; overflow:auto; }
-    table { border-collapse: collapse; width:100%; font-size:12px; }
-    th, td { border: 1px solid #e2e2e2; padding:6px; text-align:left; }
-    caption { text-align:left; font-weight:600; margin-bottom:6px; }
-    .controls { margin-top:12px; border-top:1px solid #eee; padding-top:12px; }
-    .small { font-size:12px; color:#666; }
-    .flex { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    textarea { width:100%; height:140px; font-family:monospace; }
+    body {
+      font-family: Arial, padding: 12px;
+      max-width: 1100px;
+    }
+
+    label {
+      display: block;
+      margin-top: 8px;
+    }
+
+    input[type=number],
+    input[type=text] {
+      width: 180px;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 8px;
+    }
+
+    .col {
+      flex: 1;
+      min-width: 280px;
+    }
+
+    button {
+      margin-right: 8px;
+    }
+
+    #dataArea {
+      margin-top: 16px;
+      border: 1px solid #ddd;
+      padding: 8px;
+      background: #fafafa;
+      max-height: 520px;
+      overflow: auto;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 12px;
+    }
+
+    th,
+    td {
+      border: 1px solid #e2e2e2;
+      padding: 6px;
+      text-align: left;
+    }
+
+    caption {
+      text-align: left;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .controls {
+      margin-top: 12px;
+      border-top: 1px solid #eee;
+      padding-top: 12px;
+    }
+
+    .small {
+      font-size: 12px;
+      color: #666;
+    }
+
+    .flex {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    textarea {
+      width: 100%;
+      height: 140px;
+      font-family: monospace;
+    }
   </style>
 </head>
+
 <body>
   <h2>Behavior Capture — Settings & Audit</h2>
 
   <div class="row">
     <div class="col">
       <label>Aggregation window (active ms):
-        <input id="aggregation_window_ms" type="number" min="1000" value="300000"/>
+        <input id="aggregation_window_ms" type="number" min="1000" value="300000" />
       </label>
       <label>Pause threshold (ms):
-        <input id="pause_threshold_ms" type="number" min="10" value="2000"/>
+        <input id="pause_threshold_ms" type="number" min="10" value="2000" />
       </label>
-      <label>Nudge interval (ms):
-        <input id="nudge_interval_ms" type="number" min="1000" value="600000"/>
+      <label>Nudge interval (minutes):
+        <input id="nudge_interval_mins" type="number" min="1" value="30" />
       </label>
       <label>Inactivity threshold (ms):
-        <input id="inactivity_threshold_ms" type="number" min="1000" value="30000"/>
+        <input id="inactivity_threshold_ms" type="number" min="1000" value="30000" />
       </label>
       <button id="save">Save settings</button>
       <span id="status" class="small" style="margin-left:8px;color:green"></span>
@@ -63,10 +133,11 @@
       </div>
       <div style="margin-top:8px;">
         <label>Load KMeans centroids (keyboard / mouse) as JSON:
-          <input id="centroidsInput" type="file" accept=".json"/>
+          <input id="centroidsInput" type="file" accept=".json" />
         </label>
         <button id="btnLoadCentroids">Upload centroids</button>
-        <div class="small">Centroid JSON shape: { kind: "keyboard"|"mouse", centroids: [[...],...], featureNames:[...] }</div>
+        <div class="small">Centroid JSON shape: { kind: "keyboard"|"mouse", centroids: [[...],...], featureNames:[...] }
+        </div>
       </div>
     </div>
 
@@ -80,4 +151,5 @@
   <script src="jszip.min.js"></script>
   <script src="options.js"></script>
 </body>
+
 </html>

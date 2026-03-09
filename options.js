@@ -1,11 +1,12 @@
 // options.js - Options UI, export, recompute, and centroid upload for ML hooks.
 // Includes robust loadConfig (message with timeout then fallback to chrome.storage) and logging.
 
-(function() {
+(function () {
   const aggregationWindowEl = document.getElementById('aggregation_window_ms');
   const pauseThresholdEl = document.getElementById('pause_threshold_ms');
-  const nudgeIntervalEl = document.getElementById('nudge_interval_ms');
+  const nudgeIntervalMinsEl = document.getElementById('nudge_interval_mins');
   const inactivityThresholdEl = document.getElementById('inactivity_threshold_ms');
+  const coldStartThresholdEl = document.getElementById('cold_start_hours');
   const saveBtn = document.getElementById('save');
   const statusEl = document.getElementById('status');
   const statsEl = document.getElementById('stats');
@@ -56,8 +57,9 @@
         const cfg = got.config;
         aggregationWindowEl.value = cfg.aggregation_window_ms;
         pauseThresholdEl.value = cfg.pause_threshold_ms;
-        nudgeIntervalEl.value = cfg.nudge_interval_ms;
+        nudgeIntervalMinsEl.value = Math.floor((cfg.nudge_interval_ms || 1800000) / 60000);
         inactivityThresholdEl.value = cfg.inactivity_threshold_ms;
+        coldStartThresholdEl.value = Math.floor((cfg.cold_start_threshold_ms || 86400000) / 3600000);
         log('Loaded config from background via sendMessage');
         window.__vc_config_version = cfg.config_version || window.__vc_config_version;
         await refreshStats();
@@ -73,8 +75,9 @@
       const c = s.config || {};
       aggregationWindowEl.value = c.aggregation_window_ms || 300000;
       pauseThresholdEl.value = c.pause_threshold_ms || 2000;
-      nudgeIntervalEl.value = c.nudge_interval_ms || 600000;
+      nudgeIntervalMinsEl.value = Math.floor((c.nudge_interval_ms || 1800000) / 60000);
       inactivityThresholdEl.value = c.inactivity_threshold_ms || 30000;
+      coldStartThresholdEl.value = Math.floor((c.cold_start_threshold_ms || 86400000) / 3600000);
       log('Loaded config from chrome.storage.local fallback');
     } catch (err) {
       console.error('Failed to load config from storage', err);
@@ -87,23 +90,24 @@
     const newCfg = {
       aggregation_window_ms: Number(aggregationWindowEl.value),
       pause_threshold_ms: Number(pauseThresholdEl.value),
-      nudge_interval_ms: Number(nudgeIntervalEl.value),
-      inactivity_threshold_ms: Number(inactivityThresholdEl.value)
+      nudge_interval_ms: Number(nudgeIntervalMinsEl.value) * 60000,
+      inactivity_threshold_ms: Number(inactivityThresholdEl.value),
+      cold_start_threshold_ms: Number(coldStartThresholdEl.value) * 3600000
     };
     chrome.runtime.sendMessage({ type: 'updateConfig', newConfig: newCfg });
     statusEl.textContent = 'Saved';
-    setTimeout(()=>statusEl.textContent='',2000);
+    setTimeout(() => statusEl.textContent = '', 2000);
     log('Config updated: ' + JSON.stringify(newCfg));
     await refreshStats();
   }
   saveBtn.addEventListener('click', saveConfig);
 
   async function refreshStats() {
-    const keys = ['keyboard_raw','mouse_raw','video_raw','keyboard_agg','mouse_agg','config_log'];
+    const keys = ['keyboard_raw', 'mouse_raw', 'video_raw', 'keyboard_agg', 'mouse_agg', 'config_log'];
     const s = await chrome.storage.local.get(keys);
     const parts = [];
     for (const k of keys) {
-      parts.push(`<div><strong>${k}:</strong> ${(s[k]||[]).length} rows</div>`);
+      parts.push(`<div><strong>${k}:</strong> ${(s[k] || []).length} rows</div>`);
     }
     statsEl.innerHTML = parts.join('');
   }
@@ -113,7 +117,7 @@
       chrome.runtime.sendMessage({ type: 'exportAll' }, (resp) => {
         if (resp && resp.ok && resp.data) resolve(resp.data);
         else {
-          chrome.storage.local.get(['keyboard_raw','mouse_raw','video_raw','keyboard_agg','mouse_agg','config_log'], (s) => {
+          chrome.storage.local.get(['keyboard_raw', 'mouse_raw', 'video_raw', 'keyboard_agg', 'mouse_agg', 'config_log'], (s) => {
             resolve({
               keyboard_raw: s.keyboard_raw || [],
               mouse_raw: s.mouse_raw || [],
@@ -131,14 +135,14 @@
   function arrayToCsv(arr) {
     if (!Array.isArray(arr) || arr.length === 0) return '';
     const keys = Array.from(arr.reduce((s, o) => { if (o && typeof o === 'object') Object.keys(o).forEach(k => s.add(k)); return s; }, new Set()));
-    const esc = v => { if (v === null || v === undefined) return ''; const s = typeof v === 'object' ? JSON.stringify(v) : String(v); if (/[",\n]/.test(s)) return '"' + s.replace(/"/g,'""') + '"'; return s; };
+    const esc = v => { if (v === null || v === undefined) return ''; const s = typeof v === 'object' ? JSON.stringify(v) : String(v); if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"'; return s; };
     const lines = [keys.join(',')];
     for (const o of arr) lines.push(keys.map(k => esc(o[k])).join(','));
     return lines.join('\n');
   }
 
-  async function downloadZipOfCSVs(mapOfArrays, filenamePrefix='behavior_capture_all') {
-    const ts = new Date().toISOString().replace(/[:.]/g,'-');
+  async function downloadZipOfCSVs(mapOfArrays, filenamePrefix = 'behavior_capture_all') {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `${filenamePrefix}_${ts}.zip`;
     if (typeof JSZip === 'undefined') {
       for (const k of Object.keys(mapOfArrays)) {
@@ -147,8 +151,8 @@
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url; a.download = `${k}_${ts}.csv`; document.body.appendChild(a); a.click();
-        setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 2000);
-        await new Promise(r=>setTimeout(r,250));
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 2000);
+        await new Promise(r => setTimeout(r, 250));
       }
       return;
     }
@@ -161,7 +165,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = filename; document.body.appendChild(a); a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 2000);
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 2000);
   }
 
   btnExportAll.addEventListener('click', async () => {
@@ -226,7 +230,7 @@
     } catch (err) {
       console.error('Options init failed', err);
       log('Options init failed: ' + (err && err.message ? err.message : String(err)));
-      try { await refreshStats(); } catch(e){}
+      try { await refreshStats(); } catch (e) { }
     }
   })();
 })();

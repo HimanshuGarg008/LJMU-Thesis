@@ -21,10 +21,12 @@ const STORAGE_KEYS = {
 
 const DEFAULT_CONFIG = {
   config_version: 1,
-  aggregation_window_ms: 5 * 60 * 1000,
-  nudge_interval_ms: 10 * 60 * 1000,
+  aggregation_window_ms: 10000, // 10s for LSTM windows
+  nudge_interval_ms: 30 * 60 * 1000, // 30 mins default
   pause_threshold_ms: 2000,
-  inactivity_threshold_ms: 30 * 1000
+  inactivity_threshold_ms: 30 * 1000,
+  cold_start_threshold_ms: 24 * 60 * 60 * 1000, // 24 hours
+  bridge_url: 'http://localhost:5000'
 };
 
 let CONFIG = Object.assign({}, DEFAULT_CONFIG);
@@ -50,8 +52,8 @@ async function appendConfigLog(cfg) {
   await chrome.storage.local.set({ config_log: arr });
 }
 
-function makeSessionId(prefix='sess') {
-  return `${prefix}_${Date.now().toString(36)}_${Math.floor(Math.random()*1e6).toString(36)}`;
+function makeSessionId(prefix = 'sess') {
+  return `${prefix}_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
 }
 
 async function appendRows(key, rows) {
@@ -66,8 +68,11 @@ async function appendRows(key, rows) {
 async function appendRow(key, row) { await appendRows(key, [row]); }
 
 const modalityState = {
-  keyboard: { lastTs: null, sessionId: null, sessionStartTs: null, prevKeydownTs: null, prevKeyupTs: null },
-  mouse: { lastTs: null, sessionId: null, sessionStartTs: null, prevMoveTs: null }
+  keyboard: { lastTs: null, sessionId: null, sessionStartTs: null, prevKeydownTs: null, prevKeyupTs: null, lstmBuffer: [] },
+  mouse: { lastTs: null, sessionId: null, sessionStartTs: null, prevMoveTs: null },
+  lastNudgeTs: 0,
+  currentNudgeMultiplier: 1,
+  lastPredictions: { keyboard: 0.5, mouse: 0.5 }
 };
 
 // Track which tabs have active video sessions to coordinate cross-frame suppression
@@ -102,11 +107,11 @@ async function markRawRowsWithAgg(key, rowIndices, aggWindowId) {
 
 function objectsToCsv(arr) {
   if (!Array.isArray(arr) || arr.length === 0) return '';
-  const keys = Array.from(arr.reduce((s, o) => { if (o && typeof o === 'object') Object.keys(o).forEach(k=>s.add(k)); return s; }, new Set()));
+  const keys = Array.from(arr.reduce((s, o) => { if (o && typeof o === 'object') Object.keys(o).forEach(k => s.add(k)); return s; }, new Set()));
   const esc = v => {
     if (v === null || v === undefined) return '';
     const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-    if (/[",\n]/.test(s)) return '"' + s.replace(/"/g,'""') + '"';
+    if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
     return s;
   };
   const lines = [];
@@ -117,12 +122,12 @@ function objectsToCsv(arr) {
 
 // Message handling and ingest
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  (async function() {
+  (async function () {
     if (!msg || !msg.type) return;
     await loadConfig();
 
     if (msg.type === 'keyboardEventBatch' && Array.isArray(msg.events)) {
-      const events = msg.events.slice().sort((a,b)=>a.ts-b.ts);
+      const events = msg.events.slice().sort((a, b) => a.ts - b.ts);
       const rowsToAppend = [];
       const state = modalityState.keyboard;
       for (const e of events) {
@@ -173,7 +178,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     else if (msg.type === 'mouseEventBatch' && Array.isArray(msg.events)) {
-      const events = msg.events.slice().sort((a,b)=>a.ts-b.ts);
+      const events = msg.events.slice().sort((a, b) => a.ts - b.ts);
       const rowsToAppend = [];
       const state = modalityState.mouse;
       for (const e of events) {
@@ -219,17 +224,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       payload.ts_end = payload.ts_end || (payload.ts || Date.now());
       payload.video_session_id = payload.video_session_id || makeSessionId('vid');
       payload.config_version = CONFIG.config_version;
-      
+
       // Coordination: if video is playing/checkpointing, tell the whole tab to suppress raw kbd/mouse
       if (tabId && (payload.video_state === 'playing' || payload.video_state === 'play' || payload.video_state === 'playing_checkpoint')) {
         if (!activeVideoTabs.has(tabId)) {
           activeVideoTabs.add(tabId);
-          chrome.tabs.sendMessage(tabId, { type: 'suppressRaw', active: true }).catch(() => {});
+          chrome.tabs.sendMessage(tabId, { type: 'suppressRaw', active: true }).catch(() => { });
         }
       } else if (tabId && (payload.video_state === 'pause' || payload.video_state === 'ended' || payload.video_state === 'tab_closed')) {
         // Only remove if this was the last active video in the tab (simplified for now: assume one video per tab or global pause)
         activeVideoTabs.delete(tabId);
-        chrome.tabs.sendMessage(tabId, { type: 'suppressRaw', active: false }).catch(() => {});
+        chrome.tabs.sendMessage(tabId, { type: 'suppressRaw', active: false }).catch(() => { });
       }
 
       // Keep video row succinct: we store summary stats not raw samples
@@ -237,12 +242,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete payload.samples;
       try {
         console.log('BG: received videoCursorBatch', { preview: { video_session_id: payload.video_session_id, state: payload.video_state, cursor_sample_count: payload.cursor_sample_count }, fromTab: payload.tab_id });
-      } catch(e){}
+      } catch (e) { }
       await appendRow(STORAGE_KEYS.VIDEO_RAW, payload);
     }
 
     else if (msg.type === 'videoFlushAll') {
-      try { console.log('BG: received videoFlushAll marker from tab', sender && sender.tab ? sender.tab.id : null); } catch(e){}
+      try { console.log('BG: received videoFlushAll marker from tab', sender && sender.tab ? sender.tab.id : null); } catch (e) { }
       const marker = { ts: msg.ts || Date.now(), event: 'page_hidden', tab_id: sender.tab ? sender.tab.id : null, config_version: CONFIG.config_version };
       await appendRow(STORAGE_KEYS.VIDEO_RAW, marker);
     }
@@ -286,6 +291,107 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   })();
   return true;
 });
+
+// ML INTERFACE CALLS
+async function runKeyboardInference(feat, state, rowCount) {
+  const isColdStart = (Date.now() - (state.sessionStartTs || Date.now())) < CONFIG.cold_start_threshold_ms;
+
+  if (isColdStart) {
+    try {
+      const resp = await fetch(`${CONFIG.bridge_url}/predict/keyboard_clustering`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mean_hold_ms: feat.mean_hold_ms,
+          mean_dd_ms: feat.mean_dd_ms,
+          mean_ud_ms: feat.mean_ud_ms,
+          hold_cv: feat.hold_cv,
+          dd_cv: feat.dd_cv,
+          latency_spike_count_Flag: feat.latency_spike_count > 0 ? 1 : 0
+        })
+      });
+      const res = await resp.json();
+      modalityState.lastPredictions.keyboard = res.cluster; // 0 or 1 etc
+    } catch (e) { console.error('Keyboard Clustering Error:', e); }
+  } else {
+    // Sequential LSTM
+    const lstmFeat = [
+      feat.mean_hold_ms, feat.hold_std, feat.mean_dd_ms, feat.dd_std,
+      feat.mean_ud_ms, feat.hold_std, // Placeholder for UD_std
+      feat.latency_spike_count > 0 ? 1 : 0,
+      (rowCount / (CONFIG.aggregation_window_ms / 1000)) || 0, // typing rate
+      rowCount // keystroke count
+    ];
+    state.lstmBuffer.push(lstmFeat);
+    if (state.lstmBuffer.length > 2) state.lstmBuffer.shift();
+
+    if (state.lstmBuffer.length === 2) {
+      try {
+        const resp = await fetch(`${CONFIG.bridge_url}/predict/keyboard_lstm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sequence: state.lstmBuffer })
+        });
+        const res = await resp.json();
+        modalityState.lastPredictions.keyboard = res.probability_expert;
+      } catch (e) { console.error('Keyboard LSTM Error:', e); }
+    }
+  }
+}
+
+async function runMouseInference(feat) {
+  try {
+    const resp = await fetch(`${CONFIG.bridge_url}/predict/cursor_xgb`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mean_speed: feat.mean_speed,
+        speed_std: feat.speed_std,
+        pause_fraction: feat.pause_fraction,
+        path_entropy: feat.path_entropy,
+        distance_rate: feat.total_distance / (CONFIG.aggregation_window_ms / 1000),
+        click_rate: feat.total_clicks / (CONFIG.aggregation_window_ms / 1000),
+        scroll_rate: 0, // simplified
+        movement_density: feat.movement_density,
+        jitter_index: feat.jitter_index
+      })
+    });
+    const res = await resp.json();
+    modalityState.lastPredictions.mouse = res.attention_score;
+  } catch (e) { console.error('Mouse Inference Error:', e); }
+}
+
+async function runVideoInference(payload) {
+  // Video capture only, as requested.
+  // We can add logic here if we ever want to analyze video state.
+}
+
+// NUDGING SYSTEM
+setInterval(() => {
+  const now = Date.now();
+  const baseInterval = CONFIG.nudge_interval_ms || (30 * 60 * 1000);
+  const currentInterval = baseInterval * modalityState.currentNudgeMultiplier;
+
+  if (now - modalityState.lastNudgeTs >= currentInterval) {
+    const kScore = modalityState.lastPredictions.keyboard;
+    const mScore = modalityState.lastPredictions.mouse;
+
+    // Performance check: threshold < 0.4 indicates attention dip
+    if (kScore < 0.4 || mScore < 0.4) {
+      chrome.notifications.create({
+        type: 'basic',
+        iconUrl: 'icon128.png',
+        title: 'Attention Nudge',
+        message: 'Your attention metrics are decreasing. Please try to refocus.'
+      });
+      modalityState.currentNudgeMultiplier = 1; // 30*1 = 30 mins
+    } else {
+      // Good performance: slow down by adding 1 base interval to the multiplier
+      modalityState.currentNudgeMultiplier = Math.min(5, modalityState.currentNudgeMultiplier + 1); // 1x, 2x, 3x, 4x, 5x
+    }
+    modalityState.lastNudgeTs = now;
+  }
+}, 60000);
 
 // AGGREGATION helpers (keyboard and mouse)
 async function attemptAggregations(kind) {
@@ -335,6 +441,7 @@ async function keyboardAggregator() {
         feat.config_version = CONFIG.config_version;
         feat.active_time_ms = Math.min(activeSum, CONFIG.aggregation_window_ms);
         aggArr.push(feat);
+        await runKeyboardInference(feat, modalityState.keyboard, segmentIndices.length);
         await markRawRowsWithAgg(STORAGE_KEYS.KEYBOARD_RAW, segmentIndices, feat.agg_window_id);
         segment = []; segmentIndices = []; activeSum = 0;
       }
@@ -348,9 +455,9 @@ function computeKeyboardAggregateFeatures(rows) {
   const holdVals = numeric.filter(r => typeof r.hold_ms === 'number').map(r => r.hold_ms);
   const ddVals = numeric.filter(r => typeof r.down_down_ms === 'number').map(r => r.down_down_ms);
   const udVals = numeric.filter(r => typeof r.up_down_ms === 'number').map(r => r.up_down_ms);
-  const mean = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0;
-  const std = arr => { if (!arr.length) return 0; const m = mean(arr); return Math.sqrt(arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length); };
-  const cv = arr => { const m = mean(arr); return m ? std(arr)/m : 0; };
+  const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const std = arr => { if (!arr.length) return 0; const m = mean(arr); return Math.sqrt(arr.reduce((s, x) => s + (x - m) * (x - m), 0) / arr.length); };
+  const cv = arr => { const m = mean(arr); return m ? std(arr) / m : 0; };
 
   const mean_hold = mean(holdVals);
   const mean_dd = mean(ddVals);
@@ -367,7 +474,7 @@ function computeKeyboardAggregateFeatures(rows) {
     lastTs = r.ts;
   });
   if (current_burst > 1) { burst_count++; burst_lengths.push(current_burst); }
-  const burst_mean_length = burst_lengths.length ? (burst_lengths.reduce((a,b)=>a+b,0)/burst_lengths.length) : 0;
+  const burst_mean_length = burst_lengths.length ? (burst_lengths.reduce((a, b) => a + b, 0) / burst_lengths.length) : 0;
 
   const MICRO_LOW = 100, MICRO_HIGH = 500;
   const micro_count = numeric.filter(r => (r.active_dt_ms || 0) >= MICRO_LOW && (r.active_dt_ms || 0) <= MICRO_HIGH).length;
@@ -420,6 +527,7 @@ async function mouseAggregator() {
         feat.config_version = CONFIG.config_version;
         feat.active_time_ms = Math.min(activeSum, CONFIG.aggregation_window_ms);
         aggArr.push(feat);
+        await runMouseInference(feat);
         await markRawRowsWithAgg(STORAGE_KEYS.MOUSE_RAW, segmentIndices, feat.agg_window_id);
         segment = []; segmentIndices = []; activeSum = 0;
       }
@@ -430,54 +538,56 @@ async function mouseAggregator() {
 
 function computeMouseAggregateFeatures(rows) {
   const pos = rows.filter(r => typeof r.x === 'number' && typeof r.y === 'number');
-  const total_distance = pos.reduce((sum, r, i) => { if (i === 0) return 0; const prev = pos[i-1]; return sum + Math.hypot(r.x - prev.x, r.y - prev.y); }, 0);
+  const total_distance = pos.reduce((sum, r, i) => { if (i === 0) return 0; const prev = pos[i - 1]; return sum + Math.hypot(r.x - prev.x, r.y - prev.y); }, 0);
   const speeds = [];
-  for (let i=1;i<pos.length;i++) {
-    const dx = pos[i].x - pos[i-1].x, dy = pos[i].y - pos[i-1].y;
-    const dt = Math.max(1, pos[i].ts - pos[i-1].ts);
-    speeds.push(Math.hypot(dx,dy) / (dt/1000));
+  for (let i = 1; i < pos.length; i++) {
+    const dx = pos[i].x - pos[i - 1].x, dy = pos[i].y - pos[i - 1].y;
+    const dt = Math.max(1, pos[i].ts - pos[i - 1].ts);
+    speeds.push(Math.hypot(dx, dy) / (dt / 1000));
   }
-  const mean = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0;
-  const std = arr => arr.length ? Math.sqrt(arr.reduce((s,x)=>s+(x-mean(arr))*(x-mean(arr)),0)/arr.length) : 0;
+  const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const std = arr => arr.length ? Math.sqrt(arr.reduce((s, x) => s + (x - mean(arr)) * (x - mean(arr)), 0) / arr.length) : 0;
   const mean_speed = mean(speeds);
   const max_speed = speeds.length ? Math.max(...speeds) : 0;
   const speed_std = std(speeds);
-  const jitter_index = speeds.length ? (std(speeds) / (mean_speed || 1)) : 0;
+  const jitter_index = speeds.length ? (speed_std / (mean_speed + 1e-8)) : 0;
 
-  function pathEntropy(xs, ys, bins=8) {
+  function pathEntropy(xs, ys, bins = 8) {
     if (xs.length < 2) return 0;
     const minX = Math.min(...xs), maxX = Math.max(...xs);
     const minY = Math.min(...ys), maxY = Math.max(...ys);
     const eps = 1e-9; const xRange = maxX - minX + eps; const yRange = maxY - minY + eps;
-    const H = new Array(bins*bins).fill(0);
-    for (let i=0;i<xs.length;i++) {
-      const xi = Math.min(bins-1, Math.floor(((xs[i]-minX)/xRange)*bins));
-      const yi = Math.min(bins-1, Math.floor(((ys[i]-minY)/yRange)*bins));
-      H[yi*bins + xi] += 1;
+    const H = new Array(bins * bins).fill(0);
+    for (let i = 0; i < xs.length; i++) {
+      const xi = Math.min(bins - 1, Math.floor(((xs[i] - minX) / xRange) * bins));
+      const yi = Math.min(bins - 1, Math.floor(((ys[i] - minY) / yRange) * bins));
+      H[yi * bins + xi] += 1;
     }
-    const p = H.filter(c=>c>0).map(c => c / xs.length);
+    const p = H.filter(c => c > 0).map(c => c / xs.length);
     let ent = 0; for (const pr of p) ent -= pr * Math.log2(pr); return ent;
   }
-  const xs = pos.map(p=>p.x), ys = pos.map(p=>p.y);
+  const xs = pos.map(p => p.x), ys = pos.map(p => p.y);
   const entropy = pathEntropy(xs, ys, 8);
-  const active_time_ms = rows.reduce((s,r)=>s+(r.dt_ms||0),0) || 1;
+  const active_time_ms = rows.reduce((s, r) => s + (r.dt_ms || 0), 0) || 1;
   const movement_density = total_distance / active_time_ms;
-  const dts = rows.map(r => r.dt_ms || 0).filter(v => v > 0);
-  const micro_pause_ratio = dts.length ? (dts.filter(dt => dt >= 100 && dt <= 500).length / dts.length) : 0;
-  const pause_fraction = dts.length ? (dts.filter(dt => dt > CONFIG.pause_threshold_ms).length / dts.length) : 0;
+  const dts_sec = rows.map(r => (r.dt_ms || 0) / 1000); // snippet uses seconds
+  const pause_fraction = dts_sec.length ? (dts_sec.filter(dt => dt > 0.3).length / (dts_sec.length + 1)) : 0;
   const total_clicks = rows.filter(r => r.event_type === 'click').length;
+  const total_scrolls = rows.filter(r => r.event_type === 'scroll').length;
 
   return {
     total_distance,
     mean_speed,
-    max_speed,
     speed_std,
-    jitter_index,
+    distance_rate: total_distance / (active_time_ms / 1000),
+    click_rate: total_clicks / (active_time_ms / 1000),
+    scroll_rate: total_scrolls / (active_time_ms / 1000),
     path_entropy: entropy,
     movement_density,
-    micro_pause_ratio,
     pause_fraction,
-    total_clicks
+    jitter_index,
+    total_clicks,
+    total_scrolls
   };
 }
 
@@ -562,17 +672,17 @@ async function recomputeAllAggregatesAndCompare() {
     const tol = 1e-6; const issues = [];
     if (stored.length !== recomputed.length) issues.push({ type: 'count_mismatch', stored_count: stored.length, recomputed_count: recomputed.length });
     const minLen = Math.min(stored.length, recomputed.length);
-    for (let i=0;i<minLen;i++) {
+    for (let i = 0; i < minLen; i++) {
       const sA = stored[i], rA = recomputed[i];
       for (const k of Object.keys(rA)) {
         const aVal = sA[k], bVal = rA[k];
         if (typeof bVal === 'number') {
-          const diff = Math.abs((aVal||0) - bVal);
-          if (diff > tol) issues.push({ type:'value_mismatch', index:i, key:k, stored:aVal, recomputed:bVal, diff });
+          const diff = Math.abs((aVal || 0) - bVal);
+          if (diff > tol) issues.push({ type: 'value_mismatch', index: i, key: k, stored: aVal, recomputed: bVal, diff });
         } else {
           const sa = (aVal === undefined) ? null : aVal;
           const rb = (bVal === undefined) ? null : bVal;
-          if (String(sa) !== String(rb) && k !== 'agg_window_id') issues.push({ type:'value_mismatch', index:i, key:k, stored:sa, recomputed:rb });
+          if (String(sa) !== String(rb) && k !== 'agg_window_id') issues.push({ type: 'value_mismatch', index: i, key: k, stored: sa, recomputed: rb });
         }
       }
     }

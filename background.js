@@ -67,13 +67,24 @@ async function appendRows(key, rows) {
 }
 async function appendRow(key, row) { await appendRows(key, [row]); }
 
-const modalityState = {
+let modalityState = {
   keyboard: { lastTs: null, sessionId: null, sessionStartTs: null, prevKeydownTs: null, prevKeyupTs: null, lstmBuffer: [] },
   mouse: { lastTs: null, sessionId: null, sessionStartTs: null, prevMoveTs: null },
   lastNudgeTs: 0,
   currentNudgeMultiplier: 1,
   lastPredictions: { keyboard: 0.5, mouse: 0.5 }
 };
+
+async function loadState() {
+  const s = await chrome.storage.local.get(['modality_state']);
+  if (s.modality_state) {
+    modalityState = s.modality_state;
+  }
+}
+
+async function saveState() {
+  await chrome.storage.local.set({ modality_state: modalityState });
+}
 
 // Track which tabs have active video sessions to coordinate cross-frame suppression
 const activeVideoTabs = new Set();
@@ -125,6 +136,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async function () {
     if (!msg || !msg.type) return;
     await loadConfig();
+    await loadState();
 
     if (msg.type === 'keyboardEventBatch' && Array.isArray(msg.events)) {
       const events = msg.events.slice().sort((a, b) => a.ts - b.ts);
@@ -174,7 +186,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         rowsToAppend.push(row);
       }
       await appendRows(STORAGE_KEYS.KEYBOARD_RAW, rowsToAppend);
-      attemptAggregations('keyboard');
+      await attemptAggregations('keyboard');
+      await saveState();
     }
 
     else if (msg.type === 'mouseEventBatch' && Array.isArray(msg.events)) {
@@ -213,7 +226,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         rowsToAppend.push(row);
       }
       await appendRows(STORAGE_KEYS.MOUSE_RAW, rowsToAppend);
-      attemptAggregations('mouse');
+      await attemptAggregations('mouse');
+      await saveState();
     }
 
     else if (msg.type === 'videoCursorBatch' && msg.event) {
@@ -312,7 +326,12 @@ async function runKeyboardInference(feat, state, rowCount) {
       });
       const res = await resp.json();
       modalityState.lastPredictions.keyboard = res.cluster; // 0 or 1 etc
-    } catch (e) { console.error('Keyboard Clustering Error:', e); }
+      await saveState();
+    } catch (e) {
+      console.error('Keyboard Clustering Error:', e);
+      modalityState.lastPredictions.keyboard = 1; // Fallback to safe prediction to avoid false nudges
+      await saveState();
+    }
   } else {
     // Sequential LSTM
     const lstmFeat = [
@@ -334,7 +353,14 @@ async function runKeyboardInference(feat, state, rowCount) {
         });
         const res = await resp.json();
         modalityState.lastPredictions.keyboard = res.probability_expert;
-      } catch (e) { console.error('Keyboard LSTM Error:', e); }
+        await saveState();
+      } catch (e) {
+        console.error('Keyboard LSTM Error:', e);
+        modalityState.lastPredictions.keyboard = 0.5;
+        await saveState();
+      }
+    } else {
+      await saveState();
     }
   }
 }
@@ -358,7 +384,12 @@ async function runMouseInference(feat) {
     });
     const res = await resp.json();
     modalityState.lastPredictions.mouse = res.attention_score;
-  } catch (e) { console.error('Mouse Inference Error:', e); }
+    await saveState();
+  } catch (e) {
+    console.error('Mouse Inference Error:', e);
+    modalityState.lastPredictions.mouse = 0.5;
+    await saveState();
+  }
 }
 
 async function runVideoInference(payload) {
@@ -366,32 +397,44 @@ async function runVideoInference(payload) {
   // We can add logic here if we ever want to analyze video state.
 }
 
-// NUDGING SYSTEM
-setInterval(() => {
-  const now = Date.now();
-  const baseInterval = CONFIG.nudge_interval_ms || (30 * 60 * 1000);
-  const currentInterval = baseInterval * modalityState.currentNudgeMultiplier;
+// NUDGING SYSTEM (Using Alarms instead of setInterval for MV3 durability)
+chrome.alarms.create('nudgeCheck', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'nudgeCheck') {
+    await loadConfig();
+    await loadState();
 
-  if (now - modalityState.lastNudgeTs >= currentInterval) {
-    const kScore = modalityState.lastPredictions.keyboard;
-    const mScore = modalityState.lastPredictions.mouse;
+    const now = Date.now();
+    const baseInterval = CONFIG.nudge_interval_ms || (30 * 60 * 1000);
+    const currentInterval = baseInterval * modalityState.currentNudgeMultiplier;
 
-    // Performance check: threshold < 0.4 indicates attention dip
-    if (kScore < 0.4 || mScore < 0.4) {
-      chrome.notifications.create({
-        type: 'basic',
-        iconUrl: 'icon128.png',
-        title: 'Attention Nudge',
-        message: 'Your attention metrics are decreasing. Please try to refocus.'
-      });
-      modalityState.currentNudgeMultiplier = 1; // 30*1 = 30 mins
-    } else {
-      // Good performance: slow down by adding 1 base interval to the multiplier
-      modalityState.currentNudgeMultiplier = Math.min(5, modalityState.currentNudgeMultiplier + 1); // 1x, 2x, 3x, 4x, 5x
+    if (modalityState.lastNudgeTs === 0) {
+      modalityState.lastNudgeTs = now;
+      await saveState();
     }
-    modalityState.lastNudgeTs = now;
+
+    if (now - modalityState.lastNudgeTs >= currentInterval) {
+      const kScore = modalityState.lastPredictions.keyboard || 0.5;
+      const mScore = modalityState.lastPredictions.mouse || 0.5;
+
+      // Performance check: threshold < 0.4 indicates attention dip
+      if (kScore < 0.4 || mScore < 0.4) {
+        chrome.notifications.create({
+          type: 'basic',
+          iconUrl: 'icon128.png',
+          title: 'Attention Nudge',
+          message: 'Your attention metrics are decreasing. Please try to refocus.'
+        });
+        modalityState.currentNudgeMultiplier = 1; // 30*1 = 30 mins
+      } else {
+        // Good performance: slow down by adding 1 base interval to the multiplier
+        modalityState.currentNudgeMultiplier = Math.min(5, modalityState.currentNudgeMultiplier + 1); // 1x, 2x, 3x, 4x, 5x
+      }
+      modalityState.lastNudgeTs = now;
+      await saveState();
+    }
   }
-}, 60000);
+});
 
 // AGGREGATION helpers (keyboard and mouse)
 async function attemptAggregations(kind) {
